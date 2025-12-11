@@ -87,6 +87,7 @@ def link():
 
         config = Config.load_config()
         config.hotkey_file_path = str(Path(wallet_location) / wallet_name / "hotkeys" / hotkey_name)
+        config.wallet_path = str(Path(wallet_location))
         config.save_config()
 
         message = Markdown(

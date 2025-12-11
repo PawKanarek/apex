@@ -15,9 +15,9 @@ def dashboard():
     try:
         # Load configuration
         config = Config.load_config()
-        if not config.hotkey_file_path:
+        if not config.hotkey_file_path or not config.wallet_path:
             console.print(
-                "[red]No hotkey file path found. Please run `apex link` to link your wallet and hotkey.[/red]"
+                "[red]No hotkey file path or wallet path found. Please run `apex link` to link your wallet and hotkey.[/red]"
             )
             return False
 

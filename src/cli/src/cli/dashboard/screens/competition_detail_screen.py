@@ -9,10 +9,11 @@ from textual.message import Message
 from common.models.api.competition import CompetitionRecord
 from common.models.api.submission import SubmissionRecord, SubmissionPagination
 from cli.dashboard.utils import log_success, log_debug, get_state, get_reveal_status, get_top_score_status
+from cli.dashboard.screens.hotkey_selection_screen import HotkeySelectionScreen
 from cli.dashboard.time_utils import format_datetime, get_age
 from cli.dashboard.widgets.round_details import RoundDetailsWidget
 from cli.utils.config import Config
-from cli.utils.wallet import load_keypair_from_file
+from cli.utils.wallet import load_keypair_from_file, get_all_hotkeys
 
 
 class CompetitionDetailScreen(Screen):
@@ -62,7 +63,7 @@ class CompetitionDetailScreen(Screen):
     }
 
     .submissions-section {
-        max-height: 60%;
+        height: 1fr;
         border: round $secondary;
         margin: 1;
         padding: 1;
@@ -74,7 +75,7 @@ class CompetitionDetailScreen(Screen):
     }
 
     .submissions-table {
-        /* Table will size to content, no fixed height */
+        height: 1fr;
     }
 
     .pagination-info {
@@ -92,6 +93,7 @@ class CompetitionDetailScreen(Screen):
         Binding("l", "toggle_log", "Toggle Log"),
         Binding("r", "refresh", "Refresh"),
         Binding("m", "toggle_filter", "Filter Mine"),
+        Binding("f", "filter_all_hotkeys", "Filter Hotkeys"),
         Binding("t", "filter_top", "Filter Top"),
         Binding("s", "toggle_sort", "Sort"),
         Binding("n", "next_page", "Next Page"),
@@ -113,19 +115,27 @@ class CompetitionDetailScreen(Screen):
         self.selected_submission_index = 0
         self.round_widget = None
         self.show_only_mine = False
+        self.show_all_hotkeys = False
         self.show_only_top = False
         self.user_hotkey = None
         self.sort_mode = "score"  # "score" or "time"
+        self.selected_hotkeys = []
 
-        # Load user's hotkey from config
+        # Load user's hotkey and hotkey map from config
+        self.hotkey_map = {}
         try:
             config = Config.load_config()
             if config.hotkey_file_path:
                 keypair = load_keypair_from_file(config.hotkey_file_path)
                 self.user_hotkey = keypair.ss58_address
+            
+            if config.wallet_path:
+                all_hotkeys = get_all_hotkeys(config.wallet_path)
+                self.hotkey_map = {h["ss58_address"]: h for h in all_hotkeys}
         except Exception:
-            # If we can't load the hotkey, filter won't work but app should still function
+            # If we can't load the hotkey or map, functionality will be limited but app should still work
             pass
+
 
     def compose(self) -> ComposeResult:
         """Compose the screen."""
@@ -261,11 +271,13 @@ class CompetitionDetailScreen(Screen):
             )
 
             for sub in filtered_submissions:
-                hotkey = (
-                    f"[bold green]{sub.hotkey[:8]}[/bold green]"
-                    if sub.hotkey == comp.top_scorer_hotkey
-                    else sub.hotkey[:8]
-                )
+                # Determine display name for hotkey
+                display_hotkey = sub.hotkey[:8]
+                if hasattr(self, "hotkey_map") and sub.hotkey in self.hotkey_map:
+                    info = self.hotkey_map[sub.hotkey]
+                    display_hotkey = f"{info['wallet_name']}/{info['hotkey_name']}"
+
+                hotkey = f"[bold green]{display_hotkey}[/bold green]" if sub.hotkey == comp.top_scorer_hotkey else display_hotkey
                 score = f"{sub.eval_score:.7f}" if sub.eval_score is not None else "N/A"
                 if comp.top_score_value is not None and sub.eval_score is not None:
                     if sub.eval_score >= comp.top_score_value:
@@ -328,6 +340,8 @@ class CompetitionDetailScreen(Screen):
             # Update submissions title to show filter and sort status
             if self.show_only_mine:
                 filter_status = " [dim yellow](Filtered: Mine Only)[/dim yellow]"
+            elif self.show_all_hotkeys:
+                filter_status = " [dim yellow](Filtered: All My Hotkeys)[/dim yellow]"
             elif self.show_only_top:
                 filter_status = " [dim yellow](Filtered: Top Scores)[/dim yellow]"
             else:
@@ -336,7 +350,7 @@ class CompetitionDetailScreen(Screen):
 
             # Calculate pagination info
             pagination_info = ""
-            if self.pagination:
+            if self.pagination and not self.show_all_hotkeys:
                 current_page = (self.pagination.start_idx // self.pagination.count) + 1
                 total_pages = (
                     (self.pagination.total + self.pagination.count - 1) // self.pagination.count
@@ -356,7 +370,7 @@ class CompetitionDetailScreen(Screen):
             if pagination_info:
                 container_children.append(Static(pagination_info, classes="pagination-info"))
 
-            detail_section = ScrollableContainer(
+            detail_section = Vertical(
                 *container_children,
                 classes="submissions-section",
             )
@@ -364,6 +378,8 @@ class CompetitionDetailScreen(Screen):
             # Show appropriate message based on filter and sort state
             if self.show_only_mine:
                 filter_status = " [dim yellow](Filtered: Mine Only)[/dim yellow]"
+            elif self.show_all_hotkeys:
+                filter_status = " [dim yellow](Filtered: All My Hotkeys)[/dim yellow]"
             elif self.show_only_top:
                 filter_status = " [dim yellow](Filtered: Top Score)[/dim yellow]"
             else:
@@ -377,7 +393,7 @@ class CompetitionDetailScreen(Screen):
                 message = (
                     f"[bold]Submissions[/bold]{sort_status}\n[yellow]No submissions found for this competition[/yellow]"
                 )
-            detail_section = ScrollableContainer(
+            detail_section = Vertical(
                 Static(
                     message,
                     classes="submissions-section",
@@ -437,8 +453,9 @@ class CompetitionDetailScreen(Screen):
 
         # Toggle the filter state
         self.show_only_mine = not self.show_only_mine
-        # Reset top filter when toggling mine filter
+        # Reset other filters
         self.show_only_top = False
+        self.show_all_hotkeys = False
 
         # Determine filter_mode for API call
         filter_mode = "hotkey" if self.show_only_mine else "all"
@@ -453,12 +470,56 @@ class CompetitionDetailScreen(Screen):
         # Trigger API call with filter_mode and current sort_mode, resetting to page 1
         self.app.post_message(FilterSortSubmissions(self.competition.id, filter_mode, self.sort_mode))
 
+    def action_filter_all_hotkeys(self) -> None:
+        """Open hotkey selection screen."""
+
+        def on_hotkeys_selected(selected_hotkeys: list[str]) -> None:
+            if not selected_hotkeys:
+                return
+
+            self.selected_hotkeys = selected_hotkeys
+            self.show_all_hotkeys = True
+            # Reset other filters
+            self.show_only_mine = False
+            self.show_only_top = False
+
+            # Save to config
+            try:
+                config = Config.load_config()
+                config.selected_hotkeys = selected_hotkeys
+                config.save_config()
+            except Exception as e:
+                log_widget = self.query_one("#log")
+                log_debug(log_widget, f"Failed to save selected hotkeys: {e}")
+
+            log_widget = self.query_one("#log")
+            log_success(
+                log_widget,
+                f"Filter enabled: Showing submissions from {len(selected_hotkeys)} selected hotkeys",
+            )
+
+            # Trigger API call with filter_mode="selected_hotkeys"
+            # We need to pass the selected hotkeys somehow.
+            # Since FilterSortSubmissions only takes filter_mode, we'll rely on the screen state.
+            self.app.post_message(FilterSortSubmissions(self.competition.id, "hotkeys", self.sort_mode))
+
+        # Load initial selection from config if not set
+        if not self.selected_hotkeys:
+            try:
+                config = Config.load_config()
+                self.selected_hotkeys = config.selected_hotkeys
+            except Exception:
+                self.selected_hotkeys = []
+
+        self.app.push_screen(HotkeySelectionScreen(self.selected_hotkeys), on_hotkeys_selected)
+
     def action_filter_top(self) -> None:
         """Toggle filter to show only top score submissions."""
         # Toggle the filter state
         self.show_only_top = not self.show_only_top
-        # Reset mine filter when toggling top filter
+        # Reset other filters
         self.show_only_mine = False
+        self.show_all_hotkeys = False
 
         # Determine filter_mode for API call
         filter_mode = "top_score" if self.show_only_top else "all"
@@ -515,6 +576,8 @@ class CompetitionDetailScreen(Screen):
         # Determine filter_mode for API call
         if self.show_only_mine:
             filter_mode = "hotkey"
+        elif self.show_all_hotkeys:
+            filter_mode = "hotkeys"
         elif self.show_only_top:
             filter_mode = "top_score"
         else:
@@ -542,6 +605,11 @@ class CompetitionDetailScreen(Screen):
 
     def action_next_page(self) -> None:
         """Load the next page of submissions."""
+        if self.show_all_hotkeys:
+            log_widget = self.query_one("#log")
+            log_debug(log_widget, "Pagination disabled in filtered mode")
+            return
+
         if not self.pagination or not self.pagination.has_more:
             log_widget = self.query_one("#log")
             log_debug(log_widget, "No next page available")
@@ -556,6 +624,11 @@ class CompetitionDetailScreen(Screen):
 
     def action_prev_page(self) -> None:
         """Load the previous page of submissions."""
+        if self.show_all_hotkeys:
+            log_widget = self.query_one("#log")
+            log_debug(log_widget, "Pagination disabled in filtered mode")
+            return
+
         if not self.pagination or self.pagination.start_idx == 0:
             log_widget = self.query_one("#log")
             log_debug(log_widget, "No previous page available")

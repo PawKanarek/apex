@@ -169,6 +169,85 @@ class DashboardApp(App):
             console.print(f"[red]Failed to load submissions: {e}[/red]")
             return None
 
+    async def load_filtered_submissions(
+        self,
+        competition_id: int,
+        filter_mode: str,
+        sort_mode: str,
+    ) -> SubmissionResponse | None:
+        """Helper to load submissions for multiple hotkeys (parallel requests)."""
+        from common.models.api.submission import SubmissionRequest, SubmissionResponse, SubmissionPagination
+        import asyncio
+
+        config = Config.load_config()
+        if not config.wallet_path:
+            console.print("[red]No wallet path configured. Please run `apex link`.[/red]")
+            return None
+
+        if not config.selected_hotkeys:
+            console.print("[red]No selected hotkeys configured. select at least one hotkey in filter select`.[/red]")
+            return None
+        console.print(f"[blue]Scanning {len(config.selected_hotkeys)} selected hotkeys[/blue]")
+
+        # Create tasks for each hotkey
+        try:
+            async with Client(config.hotkey_file_path, timeout=config.timeout) as client:
+                tasks = []
+                for hotkey in config.selected_hotkeys:
+                    req = SubmissionRequest(
+                        competition_id=competition_id,
+                        hotkey=hotkey,
+                        start_idx=0,
+                        count=100,
+                        filter_mode="hotkey",
+                        sort_mode=sort_mode,
+                    )
+                    tasks.append(
+                        client._make_request(
+                            method="GET",
+                            path="/miner/submission",
+                            params=req.model_dump(),
+                        )
+                    )
+
+                # Execute all requests in parallel
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                all_submissions = []
+                total_count = 0
+                has_more = False
+
+                for result in results:
+                    if isinstance(result, Exception):
+                        continue
+                    try:
+                        response_obj = SubmissionResponse.model_validate(result.json())
+                        all_submissions.extend(response_obj.submissions)
+                        total_count += response_obj.pagination.total
+                        if response_obj.pagination.has_more:
+                            has_more = True
+                    except Exception:
+                        continue
+
+                # Sort aggregated submissions locally
+                if sort_mode == "score":
+                    # Sort by score (descending), then by submit time
+                    all_submissions.sort(key=lambda x: (
+                        -(x.eval_score if x.eval_score is not None else float("-inf")),
+                        -(x.submit_at.timestamp() if x.submit_at else float("-inf"))
+                    ))
+                else:  # sort_mode == "time"
+                    # Sort by submit time (descending)
+                    all_submissions.sort(key=lambda x: -(x.submit_at.timestamp() if x.submit_at else float("-inf")))
+
+                return SubmissionResponse(
+                    submissions=all_submissions,
+                    pagination=SubmissionPagination(start_idx=0, count=100, total=total_count, has_more=has_more)
+                )
+        except Exception as e:
+            console.print(f"[red]Failed to load filtered submissions: {e}[/red]")
+            return None
+
     def on_submission_selected(self, event: SubmissionSelected) -> None:
         """Handle submission selection."""
         submission_detail_screen = SubmissionDetailScreen(event.submission)
@@ -204,17 +283,28 @@ class DashboardApp(App):
 
             # Get current filter and sort mode from the screen
             current_screen = self.screen
-            filter_mode = (
-                "hotkey"
-                if (isinstance(current_screen, CompetitionDetailScreen) and current_screen.show_only_mine)
-                else "all"
-            )
-            sort_mode = current_screen.sort_mode if isinstance(current_screen, CompetitionDetailScreen) else "score"
+            filter_mode = "all"
+
+            if isinstance(current_screen, CompetitionDetailScreen):
+                if current_screen.show_only_mine:
+                    filter_mode = "hotkey"
+                elif current_screen.show_all_hotkeys:
+                    filter_mode = "hotkeys"
+                elif current_screen.show_only_top:
+                    filter_mode = "top_score"
+                sort_mode = current_screen.sort_mode
+            else:
+                sort_mode = "score"
 
             # Load fresh submissions with current filter/sort settings
-            submissions_response = await self.load_submissions(
-                competition_id, filter_mode=filter_mode, sort_mode=sort_mode
-            )
+            if filter_mode == "hotkeys":
+                submissions_response = await self.load_filtered_submissions(
+                    competition_id, filter_mode=filter_mode, sort_mode=sort_mode
+                )
+            else:
+                submissions_response = await self.load_submissions(
+                    competition_id, filter_mode=filter_mode, sort_mode=sort_mode
+                )
             fresh_submissions = submissions_response.submissions if submissions_response else []
 
             # Update current data
@@ -296,6 +386,8 @@ class DashboardApp(App):
             if isinstance(target_screen, CompetitionDetailScreen):
                 if target_screen.show_only_mine:
                     filter_mode = "hotkey"
+                elif target_screen.show_all_hotkeys:
+                    filter_mode = "hotkeys"
                 elif target_screen.show_only_top:
                     filter_mode = "top_score"
                 else:
@@ -306,9 +398,17 @@ class DashboardApp(App):
             console.print(f"[yellow]DEBUG: filter_mode={filter_mode}, sort_mode={sort_mode}[/yellow]")
 
             # Load submissions for the requested page
-            submissions_response = await self.load_submissions(
-                competition_id, start_idx=start_idx, count=10, filter_mode=filter_mode, sort_mode=sort_mode
-            )
+            start_idx = start_idx
+            
+            if filter_mode == "hotkeys":
+                # For these modes we need to pass extra args
+                submissions_response = await self.load_filtered_submissions(
+                    competition_id, filter_mode=filter_mode, sort_mode=sort_mode
+                )
+            else:
+                submissions_response = await self.load_submissions(
+                    competition_id, start_idx=start_idx, count=10, filter_mode=filter_mode, sort_mode=sort_mode
+                )
             fresh_submissions = submissions_response.submissions if submissions_response else []
             pagination = submissions_response.pagination if submissions_response else None
             console.print(
@@ -347,10 +447,15 @@ class DashboardApp(App):
     ) -> None:
         """Load submissions with filter/sort applied, starting at page 1."""
         try:
-            # Always start at page 1 (start_idx=0) when filtering or sorting
-            submissions_response = await self.load_submissions(
-                competition_id, start_idx=0, count=10, filter_mode=filter_mode, sort_mode=sort_mode
-            )
+            if filter_mode == "hotkeys":
+                submissions_response = await self.load_filtered_submissions(
+                    competition_id, filter_mode=filter_mode, sort_mode=sort_mode
+                )
+            else:
+                # Always start at page 1 (start_idx=0) when filtering or sorting
+                submissions_response = await self.load_submissions(
+                    competition_id, start_idx=0, count=10, filter_mode=filter_mode, sort_mode=sort_mode
+                )
             fresh_submissions = submissions_response.submissions if submissions_response else []
             pagination = submissions_response.pagination if submissions_response else None
 
@@ -364,6 +469,7 @@ class DashboardApp(App):
             # Update the screen's filter/sort state to match what we requested
             if isinstance(target_screen, CompetitionDetailScreen):
                 target_screen.show_only_mine = filter_mode == "hotkey"
+                target_screen.show_all_hotkeys = filter_mode == "hotkeys"
                 target_screen.show_only_top = filter_mode == "top_score"
                 target_screen.sort_mode = sort_mode
                 target_screen.post_message(
@@ -373,7 +479,7 @@ class DashboardApp(App):
                 # Fallback: post to app (though this shouldn't happen)
                 self.post_message(RefreshCompetitionData(self.current_competition, fresh_submissions, pagination))
 
-            filter_text = "filtered" if filter_mode == "hotkey" else "all"
+            filter_text = "filtered" if filter_mode in ["hotkey", "hotkeys"] else "all"
             sort_text = sort_mode
             console.print(
                 f"[green]Loaded {len(fresh_submissions)} submissions ({filter_text}, sorted by {sort_text})[/green]"

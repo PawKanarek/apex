@@ -14,6 +14,6 @@ uv sync
 
 # Install the apex CLI as a tool (adds the 'apex' command globally)
 echo "Installing Apex CLI..."
-uv tool install src/cli --force
+uv tool install --editable src/cli --force
 
 echo "✅ Setup complete! Try running: apex --help"

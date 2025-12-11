@@ -4,7 +4,9 @@ from pydantic import BaseModel
 
 class Config(BaseModel):
     hotkey_file_path: str | None = None
+    wallet_path: str | None = None
     timeout: float = 60.0
+    selected_hotkeys: list[str] = []
 
     @classmethod
     def load_config(cls, config_file_path: Path = Path(".apex.config.json")) -> "Config":
